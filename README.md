@@ -83,30 +83,32 @@ This section is aimed at data and analytics hiring managers who want to see how 
 
 ### How to run and reproduce
 
-Place the Online Retail source files in the **`datasets/`** folder, then load them into a MySQL database (the scripts use schema **`online_retail_transaction`** and raw tables such as `online_retail_aa`, `online_retail_ab`, `online_retail_ba`, `online_retail_bb`, depending on how the extract is split). Run **`scripts/02_create_cleaned_master_table.sql`** to build the unified table **`online_retail_cleaned`** (after aligning table names and imports with your environment). Use **`scripts/01_data_cleaning_and_transformation.sql`** for the same cleansing logic in a “query-only” workflow and for the listed data-quality checks. After the cleaned table exists, run the analysis scripts in **`scripts/`** by theme (exploratory, time trends, product performance, segmentation, retention, reports) as needed. A recent MySQL version with window-function support is assumed.
+- Put the dataset files in **`datasets/`**, then import them into MySQL under schema **`online_retail_transaction`** (raw tables like `online_retail_aa`, `online_retail_ab`, `online_retail_ba`, `online_retail_bb`).  
+- Build the analysis-ready fact table by running [`scripts/02_create_cleaned_master_table.sql`](scripts/02_create_cleaned_master_table.sql) to create **`online_retail_cleaned`**.  
+- Run analysis scripts from **`scripts/`** by topic (time trends, product performance, segmentation, retention, reports).  
+- Assumes a MySQL version that supports **CTEs** and **window functions**.
 
 ### SQL scripts layout
 
-- **`scripts/01_…` and `scripts/02_…`** — Cleanse raw rows (valid quantity, price, customer, time rules; normalized text; country aliases) and union sources into **`online_retail_cleaned`** with parsed dates and calendar parts.  
-- **`scripts/Exploratory_descriptive_analysis/`** — Core aggregates for customers, sales, products, RFM-style fields, and basket-style exploration.  
-- **`scripts/Time_based_trend_analysis/`** — Calendar aggregations and cohort-style views by first purchase month.  
-- **`scripts/product_performance/`** (including **`deeper_investigation/`**) — Pareto / long-tail views, consistency, and root-cause style drills.  
-- **`scripts/Customer_segmentation/`**, **`scripts/Customer_retention/`**, **`scripts/Reports/`** — Segments, retention/churn, and summary report queries.
+- **`scripts/01_…` + `scripts/02_…`** — Data cleaning + creation of **`online_retail_cleaned`** (single source of truth).  
+- **`scripts/Exploratory_descriptive_analysis/`** — Baseline KPIs (sales, customers, products, RFM, basket patterns).  
+- **`scripts/Time_based_trend_analysis/`** — Seasonality, monthly trends, and cohort-style views.  
+- **`scripts/product_performance/`**, **`scripts/Customer_*`**, **`scripts/Reports/`** — Pareto/long-tail deep dives, segmentation & retention, and reporting outputs.
 
-### Representative SQL patterns
+### Representative SQL snippets
 
-**1. Unified cleaned table (normalize, derive dates, filter bad rows)**  
-Combines sources with consistent column names, parses **`InvoiceDate`**, standardizes a few country labels, and keeps only rows suitable for revenue analysis. Full pipeline: [`scripts/02_create_cleaned_master_table.sql`](scripts/02_create_cleaned_master_table.sql).
+**Cleaned master table creation (data quality + derived time fields)**  
+Builds a single, analysis-ready fact table by parsing timestamps, standardizing text, and filtering invalid rows. Full script: [`scripts/02_create_cleaned_master_table.sql`](scripts/02_create_cleaned_master_table.sql).
 
 ```sql
--- One branch of the master table: parse dates, normalize country, enforce row quality
+-- One branch (AA). The full script UNION ALLs AA/AB/BA/BB into online_retail_cleaned.
 SELECT
     InvoiceNo AS invoice_no,
     StockCode AS stock_code,
     LOWER(TRIM(Description)) AS description,
     Quantity AS quantity,
     STR_TO_DATE(InvoiceDate, '%m/%d/%Y %H:%i') AS invoice_date,
-    YEAR(STR_TO_DATE(InvoiceDate, '%m/%d/%Y %H:%i')) AS invoice_year,
+    MONTH(STR_TO_DATE(InvoiceDate, '%m/%d/%Y %H:%i')) AS invoice_month,
     UnitPrice AS unit_price,
     CustomerID AS customer_id,
     CASE
@@ -118,73 +120,82 @@ FROM online_retail_transaction.online_retail_aa
 WHERE Quantity > 0
   AND UnitPrice > 0
   AND CustomerId != 0
-  AND CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(InvoiceDate, ' ', -1), ':', 1) AS UNSIGNED) < 24
--- Additional sources are UNION ALL’d in the same script to form online_retail_cleaned.
+  AND CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(InvoiceDate, ' ', -1), ':', 1) AS UNSIGNED) < 24;
 ```
 
-**2. Pareto-style concentration (running share of revenue)**  
-Aggregates revenue by product, then uses windowed sums to compute cumulative percentage of total sales—supporting the “how much of revenue sits in the head vs. tail” narrative. Full definition: [`scripts/product_performance/01_pareto_analysis.sql`](scripts/product_performance/01_pareto_analysis.sql).
+**Monthly revenue trend with seasonality (revenue + orders + AOV)**  
+Summarizes performance by month to expose seasonality and separate **volume** effects (orders/units) from value effects (AOV). Full script: [`scripts/Time_based_trend_analysis/01_sales_by_date.sql`](scripts/Time_based_trend_analysis/01_sales_by_date.sql).
+
+```sql
+-- Monthly rollup (seasonality + volume vs value signals)
+SELECT
+    DATE_FORMAT(invoice_date, '%Y-%m') AS year_month,
+    COUNT(DISTINCT invoice_no) AS orders,
+    SUM(quantity) AS units,
+    ROUND(SUM(unit_price * quantity), 2) AS revenue,
+    ROUND(SUM(unit_price * quantity) / COUNT(DISTINCT invoice_no), 2) AS aov,
+    ROUND(SUM(unit_price * quantity) / NULLIF(SUM(quantity), 0), 2) AS avg_selling_price,
+    ROUND(AVG(unit_price), 2) AS avg_unit_price,
+    ROUND(AVG(quantity), 2) AS avg_units_per_line
+FROM online_retail_transaction.online_retail_cleaned
+GROUP BY DATE_FORMAT(invoice_date, '%Y-%m')
+ORDER BY year_month;
+```
+
+**Product Pareto analysis (concentration + long tail cut)**  
+Uses window functions to compute cumulative revenue share by product, quantifying how much of revenue sits in the “head” vs the long tail. Full script: [`scripts/product_performance/01_pareto_analysis.sql`](scripts/product_performance/01_pareto_analysis.sql).
 
 ```sql
 WITH sales_data AS (
     SELECT
         description AS product,
-        SUM(quantity) AS total_quantity,
         ROUND(SUM(unit_price * quantity), 2) AS total_sales
     FROM online_retail_transaction.online_retail_cleaned
     GROUP BY description
 ),
-grand_total AS (
+totals AS (
     SELECT SUM(total_sales) AS grand_total_sales FROM sales_data
 ),
-ranked_sales AS (
+ranked AS (
     SELECT
         product,
         total_sales,
+        ROUND(SUM(total_sales) OVER (ORDER BY total_sales DESC), 2) AS running_sales,
         ROUND(SUM(total_sales) OVER (ORDER BY total_sales DESC) * 100.0 /
-              (SELECT grand_total_sales FROM grand_total), 2) AS cumulative_pct
+              (SELECT grand_total_sales FROM totals), 2) AS cumulative_pct
     FROM sales_data
 )
-SELECT * FROM ranked_sales WHERE cumulative_pct > 80;  -- tail beyond ~80% cumulative revenue
+SELECT product, total_sales, cumulative_pct
+FROM ranked
+ORDER BY total_sales DESC
+LIMIT 15;
 ```
 
-**3. Monthly seasonality (volume and revenue by calendar month)**  
-Rolls the cleaned fact table to month to expose growth and seasonal peaks (e.g. holiday months) in line with the charts above. Full file: [`scripts/Time_based_trend_analysis/01_sales_by_date.sql`](scripts/Time_based_trend_analysis/01_sales_by_date.sql).
+**Advanced: customer activity tiers (CTEs + window function)**  
+Creates a customer-month activity timeline and assigns tiers (new/engaged/loyal) based on distinct active months. Full script: [`scripts/Customer_retention/01_churn_and_actitivity_tiers.sql`](scripts/Customer_retention/01_churn_and_actitivity_tiers.sql).
 
 ```sql
--- Revenue and order counts by month (2011 in this dataset)
-SELECT
-    MONTH(invoice_date) AS invoice_month,
-    COUNT(DISTINCT invoice_no) AS total_invoices,
-    SUM(quantity) AS total_quantity,
-    ROUND(SUM(unit_price * quantity), 2) AS total_sales,
-    ROUND(AVG(unit_price), 2) AS average_unit_price
-FROM online_retail_transaction.online_retail_cleaned
-GROUP BY MONTH(invoice_date)
-ORDER BY invoice_month;
-```
-
-**4. Cohort framing (first purchase month per customer)**  
-Defines each customer’s cohort from their first invoice month and rolls spend and activity—useful for retention and lifecycle context alongside product and country views. Full query: [`scripts/Time_based_trend_analysis/02_Cohort_analysis.sql`](scripts/Time_based_trend_analysis/02_Cohort_analysis.sql).
-
-```sql
--- Per customer: first purchase month, activity span, spend
-WITH first_purchase AS (
+WITH months_of_activity AS (
     SELECT
         customer_id,
-        DATE_FORMAT(MIN(invoice_date), '%Y-%m') AS cohort_month,
-        TIMESTAMPDIFF(MONTH, MIN(DATE(invoice_date)), MAX(DATE(invoice_date))) AS months_of_activity,
-        COUNT(DISTINCT invoice_no) AS total_invoices,
-        ROUND(SUM(unit_price * quantity), 2) AS total_spent
+        DATE_FORMAT(invoice_date, '%Y-%m') AS activity_month,
+        DENSE_RANK() OVER (PARTITION BY customer_id ORDER BY invoice_date) AS month_rank
     FROM online_retail_transaction.online_retail_cleaned
+),
+activity_tiers AS (
+    SELECT customer_id, COUNT(DISTINCT activity_month) AS active_months
+    FROM months_of_activity
     GROUP BY customer_id
 )
-SELECT cohort_month,
-       COUNT(DISTINCT customer_id) AS customers,
-       ROUND(SUM(total_spent), 2) AS cohort_revenue
-FROM first_purchase
-GROUP BY cohort_month
-ORDER BY cohort_month;
+SELECT customer_id,
+       CASE WHEN active_months BETWEEN 1 AND 2 THEN 'new'
+            WHEN active_months BETWEEN 3 AND 5 THEN 'engaged'
+            ELSE 'loyal' END AS activity_tier
+FROM activity_tiers;
 ```
+
+### Visualizations
+
+The charts embedded above (monthly revenue trend/seasonality and country concentration) were produced from the same `online_retail_cleaned` fact table and are directly reproducible using the time-trend and country/product scripts in `scripts/`.
 
 ---
